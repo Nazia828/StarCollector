@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Star Collector — Online</title>
+<style>
+  :root{ --bg:#070b1a; --ink:#eaf2ff; --dim:#7d8ab8; --gold:#ffd23f; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:var(--bg);overflow:hidden;
+    font-family:"Courier New",ui-monospace,Menlo,Consolas,monospace;color:var(--ink);}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;box-shadow:0 0 80px rgba(70,110,255,.12);}
+  /* join overlay */
+  #join{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:radial-gradient(circle at 50% 40%, #0d1330 0%, #05070f 75%);}
+  .panel{width:min(480px,92vw);text-align:center;padding:36px 28px;border:1px solid #2a3560;
+    border-radius:14px;background:rgba(10,15,38,.85);}
+  .panel h1{color:var(--gold);font-size:34px;letter-spacing:2px;text-shadow:0 0 22px rgba(255,210,63,.55);margin-bottom:6px;}
+  .panel p{color:var(--dim);font-size:14px;margin-bottom:22px;}
+  .panel label{display:block;text-align:left;font-size:13px;color:var(--dim);margin:14px 0 5px;}
+  .panel input{width:100%;padding:12px 14px;font:inherit;font-size:17px;color:var(--ink);
+    background:#0a1026;border:1px solid #33406e;border-radius:8px;outline:none;text-transform:none;}
+  .panel input:focus{border-color:var(--gold);}
+  #roomIn{text-transform:uppercase;letter-spacing:6px;}
+  .panel button{margin-top:24px;width:100%;padding:14px;font:inherit;font-weight:bold;font-size:18px;
+    color:#081020;background:var(--gold);border:none;border-radius:8px;cursor:pointer;letter-spacing:1px;}
+  .panel button:hover{filter:brightness(1.1);}
+  #err{color:#ff7a7a;font-size:14px;margin-top:14px;min-height:18px;}
+  .hidden{display:none !important;}
+  #hint{position:fixed;left:0;right:0;bottom:8px;text-align:center;color:#3d4770;font-size:12px;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+
+<div id="join">
+  <div class="panel">
+    <h1>★ STAR COLLECTOR ★</h1>
+    <p>Online stardust scramble · 1–6 pilots · 45 seconds</p>
+    <label for="nameIn">Call sign</label>
+    <input id="nameIn" maxlength="10" placeholder="e.g. NOVA" autocomplete="off">
+    <label for="roomIn">Room code <span style="opacity:.6">(blank = create a new room)</span></label>
+    <input id="roomIn" maxlength="4" placeholder="ABCD" autocomplete="off">
+    <div id="srvRow" class="hidden">
+      <label for="srvIn">Server address <span style="opacity:.6">(host:port of the running game server)</span></label>
+      <input id="srvIn" placeholder="localhost:3000" autocomplete="off">
+    </div>
+    <button id="goBtn">LAUNCH ▶</button>
+    <div id="err"></div>
+  </div>
+</div>
+<div id="hint">Keyboard required · ◄ ► / A D turn · ▲ / W thrust · SPACE fire</div>
+
+<script>
+"use strict";
+/* ============================================================
+   Client — rendering, interpolation, input, sound.
+   All authoritative logic lives on the server.
+   ============================================================ */
+const TAU=Math.PI*2;
+const rand=(a,b)=>a+Math.random()*(b-a);
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+function lerpWrap(a,b,t,span){let d=b-a;if(d>span/2)d-=span;if(d<-span/2)d+=span;
+  let v=a+d*t;if(v<0)v+=span;if(v>=span)v-=span;return v;}
+function lerpAng(a,b,t){let d=b-a;while(d>Math.PI)d-=TAU;while(d<-Math.PI)d+=TAU;return a+d*t;}
+const reducedMotion=window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const SLOT_COLORS=["#ffd23f","#41e0d0","#ff6b9d","#a97bff","#4e9bff","#ff5d5d"];
+const SLOT_SHAPES=["dart","wing","saucer","prong","arrow","twin"];
+const SHIP_PATHS={ // six distinct silhouettes, nose points +x
+  dart:  [[18,0],[-12,-10],[-6,0],[-12,10]],
+  wing:  [[16,0],[2,-4],[-8,-14],[-4,0],[-8,14],[2,4]],
+  saucer:[[14,0],[6,-8],[-8,-8],[-14,0],[-8,8],[6,8]],
+  prong: [[18,-7],[6,-3],[-12,-9],[-8,0],[-12,9],[6,3],[18,7],[10,0]],
+  arrow: [[20,0],[4,-6],[-4,-12],[-10,-5],[-10,5],[-4,12],[4,6]],
+  twin:  [[14,-9],[-10,-12],[-4,-4],[-14,0],[-4,4],[-10,12],[14,9],[6,0]],
+};
+const POWERS={
+  tri:{color:"#3dff6e",name:"TRI-SHOT"}, shotgun:{color:"#a855f7",name:"SHOTGUN"},
+  invinc:{color:"#ff9a3d",name:"INVINCIBLE"}, laser:{color:"#ffffff",name:"LASER"},
+  shrink:{color:"#ff2ec4",name:"SHRINK"},
+};
+
+/* ---------- audio ---------- */
+const Sfx={ctx:null,vol:0.22,
+  ensure(){if(!this.ctx){try{this.ctx=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}}},
+  tone(f,d,type="sine",v=1,slide=0){if(!this.ctx)return;const t=this.ctx.currentTime;
+    const o=this.ctx.createOscillator(),g=this.ctx.createGain();
+    o.type=type;o.frequency.setValueAtTime(f,t);
+    if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(30,f+slide),t+d);
+    g.gain.setValueAtTime(this.vol*v,t);g.gain.exponentialRampToValueAtTime(0.0001,t+d);
+    o.connect(g).connect(this.ctx.destination);o.start(t);o.stop(t+d+0.02);},
+  pickup(){this.tone(920,0.09,"triangle",0.9);},
+  cluster(){this.tone(660,0.08,"triangle");setTimeout(()=>this.tone(880,0.08,"triangle"),70);setTimeout(()=>this.tone(1180,0.12,"triangle"),140);},
+  fire(){this.tone(300,0.12,"square",0.6,-180);},
+  boomShot(){this.tone(200,0.16,"square",0.8,-140);},
+  laser(){this.tone(1400,0.28,"sawtooth",0.5,-900);},
+  zap(){this.tone(180,0.22,"sawtooth",0.9,-120);},
+  thud(){this.tone(90,0.25,"sine",1.1,-40);},
+  rock(){this.tone(140,0.14,"square",0.7,-60);},
+  power(){this.tone(520,0.1,"triangle");setTimeout(()=>this.tone(780,0.14,"triangle"),90);},
+  tick(){this.tone(520,0.07,"square",0.5);},
+  go(){this.tone(780,0.25,"square",0.8,140);},
+  win(){[523,659,784,1046].forEach((f,i)=>setTimeout(()=>this.tone(f,0.22,"triangle"),i*130));},
+};
+
+/* ---------- FX ---------- */
+const FX={parts:[],pops:[],shakeT:0,shakeAmp:0,
+  burst(x,y,color,n=10,spd=140){for(let i=0;i<n;i++){const a=rand(0,TAU),s=rand(spd*.3,spd);
+    this.parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:rand(.3,.7),t:0,color,r:rand(1.5,3.5)});}},
+  pop(x,y,text,color){this.pops.push({x,y,text,color,t:0});},
+  shake(a,d=0.3){if(reducedMotion)return;this.shakeAmp=Math.max(this.shakeAmp,a);this.shakeT=Math.max(this.shakeT,d);},
+  update(dt){this.parts=this.parts.filter(p=>{p.t+=dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.vx*=.96;p.vy*=.96;return p.t<p.life;});
+    this.pops=this.pops.filter(p=>{p.t+=dt;p.y-=34*dt;return p.t<1.1;});
+    if(this.shakeT>0){this.shakeT-=dt;if(this.shakeT<=0)this.shakeAmp=0;}},
+  offset(){if(this.shakeT<=0)return[0,0];const a=this.shakeAmp*this.shakeT;return[rand(-a,a),rand(-a,a)];},
+  render(ctx){for(const p of this.parts){ctx.globalAlpha=1-p.t/p.life;ctx.fillStyle=p.color;
+      ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,TAU);ctx.fill();}
+    ctx.globalAlpha=1;ctx.textAlign="center";ctx.font="bold 20px 'Courier New',monospace";
+    for(const p of this.pops){ctx.globalAlpha=1-p.t/1.1;ctx.fillStyle=p.color;ctx.fillText(p.text,p.x,p.y);}
+    ctx.globalAlpha=1;},
+  clear(){this.parts.length=0;this.pops.length=0;this.shakeT=0;},
+};
+
+/* ---------- state ---------- */
+const Net={ws:null,id:null,slot:-1,code:null};
+let CFG={arenaW:1280,arenaH:720,roundLength:45,finalRushAt:10,magnetRadius:58};
+let roomState="LOBBY", roomPlayers=[], iAmHost=false, inRound=false;
+let prevSnap=null, curSnap=null, prevAt=0, curAt=0, resultsData=null, lastCd=null;
+const stars=[];
+
+const canvas=document.getElementById("game");
+const ctx=canvas.getContext("2d");
+function fit(){const s=Math.min(innerWidth/CFG.arenaW,(innerHeight-30)/CFG.arenaH);
+  canvas.width=CFG.arenaW;canvas.height=CFG.arenaH;
+  canvas.style.width=(CFG.arenaW*s)+"px";canvas.style.height=(CFG.arenaH*s)+"px";}
+addEventListener("resize",fit);
+
+/* ---------- join flow ---------- */
+const $=(id)=>document.getElementById(id);
+const params=new URLSearchParams(location.search);
+if(params.get("room")) $("roomIn").value=params.get("room").toUpperCase().slice(0,4);
+$("nameIn").focus();
+$("goBtn").addEventListener("click",connect);
+addEventListener("keydown",e=>{if(e.key==="Enter"&&!$("join").classList.contains("hidden"))connect();});
+
+/* ---------- server address resolution ----------
+   The page is normally served BY the game server, so location.host is the
+   server. If the file was opened directly (file://) or hosted elsewhere,
+   location.host is empty/wrong — reveal a field to type the address. */
+function defaultServer(){
+  return (location.protocol==="http:"||location.protocol==="https:") && location.host
+    ? location.host : "";
+}
+function showServerField(msg){
+  $("srvRow").classList.remove("hidden");
+  if(msg) $("err").textContent = msg;
+  if(!$("srvIn").value) $("srvIn").value = "localhost:3000";
+}
+if(!defaultServer()){
+  showServerField("Heads up: this page isn't being served by the game server. "
+    + "Run `npm start`, then open http://localhost:3000 — or enter the server address below.");
+}
+
+function connect(){
+  Sfx.ensure();
+  $("err").textContent = "";
+  let host = defaultServer();
+  let secure = location.protocol === "https:";
+
+  // manual override (visible whenever auto-detection can't work or has failed)
+  if(!$("srvRow").classList.contains("hidden") && $("srvIn").value.trim()){
+    let m = $("srvIn").value.trim();
+    const schemeMatch = m.match(/^(https|http|wss|ws):\/\//i);
+    if(schemeMatch){ secure = /^(https|wss)$/i.test(schemeMatch[1]); m = m.slice(schemeMatch[0].length); }
+    host = m.replace(/\/.*$/, "");            // strip any path
+  }
+
+  if(!host){
+    showServerField("No server address. Run `npm start`, then open http://localhost:3000 "
+      + "in your browser — or type the server's host:port above.");
+    return;
+  }
+
+  let ws;
+  try { ws = new WebSocket((secure ? "wss://" : "ws://") + host); }
+  catch(e){
+    showServerField("\"" + host + "\" isn't a valid server address. Use host:port, e.g. localhost:3000 "
+      + "or 192.168.1.42:3000.");
+    return;
+  }
+  Net.host = host; Net.secure = secure;
+  Net.ws = ws;
+  let opened = false;
+  ws.addEventListener("open", ()=>{
+    opened = true;
+    ws.send(JSON.stringify({t:"join", name:$("nameIn").value, room:$("roomIn").value}));
+  });
+  ws.addEventListener("message", e=>handle(JSON.parse(e.data)));
+  ws.addEventListener("close", ()=>{
+    $("join").classList.remove("hidden");
+    if(opened){ $("err").textContent = "Disconnected from server."; }
+    else showServerField("Couldn't reach a game server at " + host + ". "
+      + "Make sure it's running (`npm start`) and the address is right.");
+  });
+  ws.addEventListener("error", ()=>{ /* close handler shows the message */ });
+}
+
+function handle(m){
+  if(m.t==="error"){$("err").textContent=m.m;return;}
+  if(m.t==="joined"){
+    Net.id=m.id;Net.slot=m.slot;Net.code=m.code;CFG=Object.assign(CFG,m.config);
+    try{ history.replaceState(null,"","?room="+m.code); }catch(e){}
+    $("join").classList.add("hidden");fit();canvas.focus();
+    if(stars.length===0)for(let i=0;i<130;i++)stars.push({x:rand(0,CFG.arenaW),y:rand(0,CFG.arenaH),
+      r:rand(.4,1.8),s:rand(2,14),a:rand(.25,.9)});
+    return;
+  }
+  if(m.t==="room"){
+    roomState=m.state;roomPlayers=m.players;
+    const me=m.players.find(p=>p.slot===Net.slot);
+    iAmHost=!!(me&&me.host); inRound=!!(me&&me.inRound);
+    if(m.state==="LOBBY"){prevSnap=curSnap=null;resultsData=null;FX.clear();}
+    return;
+  }
+  if(m.t==="snap"){
+    roomState=m.ph;
+    prevSnap=curSnap;prevAt=curAt;
+    curSnap=m;curAt=performance.now();
+    if(m.res)resultsData=m.res;
+    // countdown ticks
+    if(m.ph==="SPLASH"){
+      if(lastCd!==m.cd){lastCd=m.cd;m.cd>0?Sfx.tick():Sfx.go();}
+    } else lastCd=null;
+    if(m.ph==="RESULTS"&&!handle._won){handle._won=true;Sfx.win();}
+    if(m.ph!=="RESULTS")handle._won=false;
+    for(const ev of (m.ev||[]))onEvent(ev);
+  }
+}
+
+function onEvent(ev){
+  switch(ev.e){
+    case "pickup": FX.burst(ev.x,ev.y,ev.c,ev.v>1?16:6,120);
+      if(ev.v>1){FX.pop(ev.x,ev.y-14,"+"+ev.v+" CLUSTER!",ev.c);Sfx.cluster();}else Sfx.pickup(); break;
+    case "zap": FX.pop(ev.x,ev.y-26,ev.txt,ev.c);FX.pop(CFG.arenaW/2,90,ev.who+" HIT!",ev.c);
+      FX.burst(ev.x,ev.y,ev.c,14,200);FX.shake(9);Sfx.zap(); break;
+    case "crash": FX.pop(ev.x,ev.y-46,"CRASH!","#ffffff");
+      if(ev.drop>0)FX.pop(ev.x,ev.y-24,"-"+ev.drop,"#ff8866");
+      FX.burst(ev.x,ev.y,"#c9c9c9",14,180);FX.shake(9);Sfx.thud(); break;
+    case "boom": FX.burst(ev.x,ev.y,"#b9c2d8",Math.round(ev.r/2)+6,160);Sfx.rock(); break;
+    case "power": FX.pop(ev.x,ev.y-30,ev.who+": "+POWERS[ev.type].name+"!",ev.c);
+      FX.burst(ev.x,ev.y,ev.c,20,200);Sfx.power(); break;
+    case "storm": FX.pop(CFG.arenaW/2,120,"DEBRIS STORM!","#ff5555");Sfx.thud(); break;
+    case "fire": ev.big?Sfx.boomShot():Sfx.fire(); break;
+    case "laser": Sfx.laser(); break;
+  }
+}
+
+/* ---------- input ---------- */
+const keys={l:false,r:false,u:false};
+function sendInput(){if(Net.ws&&Net.ws.readyState===1)Net.ws.send(JSON.stringify({t:"input",...keys}));}
+addEventListener("keydown",e=>{
+  if($("join")&&!$("join").classList.contains("hidden"))return;
+  if(["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space"].includes(e.code))e.preventDefault();
+  Sfx.ensure();
+  let ch=false;
+  if(e.code==="ArrowLeft"||e.code==="KeyA"){if(!keys.l){keys.l=true;ch=true;}}
+  if(e.code==="ArrowRight"||e.code==="KeyD"){if(!keys.r){keys.r=true;ch=true;}}
+  if(e.code==="ArrowUp"||e.code==="KeyW"){if(!keys.u){keys.u=true;ch=true;}}
+  if(ch)sendInput();
+  if(e.code==="Space"&&!e.repeat&&Net.ws)Net.ws.send(JSON.stringify({t:"fire"}));
+  if(e.code==="Enter"&&iAmHost){
+    if(roomState==="LOBBY")Net.ws.send(JSON.stringify({t:"start"}));
+    else if(roomState==="RESULTS")Net.ws.send(JSON.stringify({t:"again"}));
+  }
+  if(e.code==="KeyB"&&iAmHost&&roomState==="RESULTS")Net.ws.send(JSON.stringify({t:"lobby"}));
+});
+addEventListener("keyup",e=>{
+  let ch=false;
+  if(e.code==="ArrowLeft"||e.code==="KeyA"){if(keys.l){keys.l=false;ch=true;}}
+  if(e.code==="ArrowRight"||e.code==="KeyD"){if(keys.r){keys.r=false;ch=true;}}
+  if(e.code==="ArrowUp"||e.code==="KeyW"){if(keys.u){keys.u=false;ch=true;}}
+  if(ch)sendInput();
+});
+
+/* ============================================================
+   RENDERING — interpolate between the two latest snapshots
+   ============================================================ */
+const INTERP_DELAY=80; // ms behind live for smooth playback
+
+function interpState(){
+  if(!curSnap)return null;
+  if(!prevSnap)return curSnap;
+  const span=Math.max(1,curAt-prevAt);
+  const t=clamp((performance.now()-INTERP_DELAY-prevAt)/span,0,1);
+  const byId=(arr,idx)=>{const m=new Map();for(const e of arr)m.set(e[idx],e);return m;};
+  const pd=byId(prevSnap.deb,0),ps=byId(prevSnap.shots,0),pm=byId(prevSnap.motes,0);
+  const pShips=new Map(prevSnap.ships.map(s=>[s.sl,s]));
+  return {
+    ...curSnap,
+    ships: curSnap.ships.map(s=>{
+      const p=pShips.get(s.sl);if(!p)return s;
+      return {...s,
+        x:lerpWrap(p.x,s.x,t,CFG.arenaW), y:lerpWrap(p.y,s.y,t,CFG.arenaH),
+        a:lerpAng(p.a,s.a,t)};
+    }),
+    deb: curSnap.deb.map(d=>{
+      const p=pd.get(d[0]);if(!p)return d;
+      return [d[0],lerpWrap(p[1],d[1],t,CFG.arenaW),lerpWrap(p[2],d[2],t,CFG.arenaH),
+        d[3],p[4]+(d[4]-p[4])*t,d[5],d[6]];
+    }),
+    shots: curSnap.shots.map(b=>{
+      const p=ps.get(b[0]);if(!p)return b;
+      return [b[0],lerpWrap(p[1],b[1],t,CFG.arenaW),lerpWrap(p[2],b[2],t,CFG.arenaH),b[3]];
+    }),
+    motes: curSnap.motes.map(m=>{
+      const p=pm.get(m[0]);if(!p)return m;
+      return [m[0],lerpWrap(p[1],m[1],t,CFG.arenaW),lerpWrap(p[2],m[2],t,CFG.arenaH),m[3]];
+    }),
+  };
+}
+
+function drawStarShape(c,x,y,r,points){
+  c.beginPath();
+  for(let i=0;i<points*2;i++){const a=i/(points*2)*TAU-Math.PI/2;
+    const rr=i%2===0?r:r*0.45;
+    const px=x+Math.cos(a)*rr,py=y+Math.sin(a)*rr;
+    i?c.lineTo(px,py):c.moveTo(px,py);}
+  c.closePath();c.fill();
+}
+
+function drawShip(c,s){
+  const color=SLOT_COLORS[s.sl],shape=SLOT_SHAPES[s.sl];
+  const scale=s.sh?0.6:1;
+  c.save();c.translate(s.x,s.y);
+  if(s.pw==="invinc"){ // rainbow invincibility ring
+    const hue=(performance.now()/6)%360;
+    c.strokeStyle=`hsl(${hue} 100% 65%)`;c.lineWidth=3;
+    c.beginPath();c.arc(0,0,24*scale+Math.sin(performance.now()/60)*2,0,TAU);c.stroke();
+  } else if(s.pw){ // active weapon aura
+    c.strokeStyle=POWERS[s.pw].color;c.globalAlpha=.75;c.lineWidth=2;
+    c.beginPath();c.arc(0,0,23*scale,0,TAU);c.stroke();c.globalAlpha=1;
+  }
+  if(s.sw>0){c.strokeStyle="rgba(120,190,255,.8)";c.lineWidth=2;
+    c.beginPath();c.arc(0,0,20*scale+Math.sin(performance.now()/70)*2,0,TAU);c.stroke();}
+  if(s.iv>0&&s.pw!=="invinc"&&Math.floor(s.iv*12)%2===0)c.globalAlpha=0.35;
+  c.rotate(s.a);c.scale(scale,scale);
+  if(s.th){c.fillStyle="rgba(255,180,80,.9)";
+    c.beginPath();c.moveTo(-14,0);c.lineTo(-24-rand(0,6),-4);c.lineTo(-24-rand(0,6),4);c.closePath();c.fill();}
+  c.fillStyle=s.fl?"#ffffff":color;
+  c.strokeStyle="rgba(255,255,255,.75)";c.lineWidth=1.5;
+  c.shadowColor=color;c.shadowBlur=12;
+  const path=SHIP_PATHS[shape];
+  c.beginPath();path.forEach((p,i)=>i?c.lineTo(p[0],p[1]):c.moveTo(p[0],p[1]));
+  c.closePath();c.fill();c.stroke();
+  c.restore();
+  // name tag + stun stars
+  c.textAlign="center";c.font="12px 'Courier New',monospace";
+  c.fillStyle=s.sl===Net.slot?"#ffffff":"rgba(255,255,255,.55)";
+  c.fillText(s.nm,s.x,s.y+30*scale+8);
+  if(s.st>0){c.fillStyle="#fff";c.font="14px monospace";c.fillText("✶ ✶",s.x,s.y-26*scale-4);}
+}
+
+function render(){
+  const W=CFG.arenaW,H=CFG.arenaH;
+  const grad=ctx.createRadialGradient(W/2,H/2,100,W/2,H/2,780);
+  grad.addColorStop(0,"#0d1330");grad.addColorStop(1,"#05070f");
+  ctx.fillStyle=grad;ctx.fillRect(0,0,W,H);
+  const t=performance.now()/1000;
+  for(const s of stars){const y=(s.y+t*s.s)%H;
+    ctx.globalAlpha=s.a;ctx.fillStyle="#cfe0ff";ctx.fillRect(s.x,y,s.r,s.r);}
+  ctx.globalAlpha=1;
+
+  const [sx,sy]=FX.offset();ctx.save();ctx.translate(sx,sy);
+
+  if(roomState==="LOBBY")renderLobby();
+  else{
+    const S=interpState();
+    if(S){
+      renderWorld(S);FX.render(ctx);renderHUD(S);
+      if(roomState==="SPLASH")renderSplash(S);
+      if(roomState==="RESULTS")renderResults();
+      if(!inRound&&roomState!=="RESULTS")banner("Spectating — you'll join the next round");
+    }
+  }
+  ctx.restore();
+}
+
+function renderWorld(S){
+  // stardust
+  for(const m of S.motes){
+    const v=m[3],tw=1+Math.sin(performance.now()/300+m[0])*.25;
+    ctx.save();ctx.fillStyle=v>1?"#ffe98a":"#fff6c9";
+    ctx.shadowColor="#ffd23f";ctx.shadowBlur=v>1?18:8;
+    drawStarShape(ctx,m[1],m[2],(v>1?10:5)*tw,v>1?5:4);ctx.restore();
+  }
+  // power-up stars: big, colored, slowly spinning
+  for(const p of S.pows){
+    const pw=POWERS[p[3]],pulse=1+Math.sin(performance.now()/220+p[0])*.18;
+    ctx.save();ctx.translate(p[1],p[2]);ctx.rotate(performance.now()/900);
+    ctx.fillStyle=pw.color;ctx.shadowColor=pw.color;ctx.shadowBlur=22;
+    drawStarShape(ctx,0,0,13*pulse,5);
+    ctx.rotate(-performance.now()/900);
+    ctx.shadowBlur=0;ctx.strokeStyle=pw.color;ctx.globalAlpha=.5;ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.arc(0,0,19*pulse,0,TAU);ctx.stroke();
+    ctx.restore();
+  }
+  // debris
+  for(const d of S.deb){
+    const [,x,y,r,rot,panic,verts]=d;
+    ctx.save();ctx.translate(x,y);ctx.rotate(rot);
+    ctx.fillStyle=panic?"#6b4a4a":"#4d5568";ctx.strokeStyle=panic?"#a86e6e":"#77809b";ctx.lineWidth=2;
+    ctx.beginPath();
+    verts.forEach((v,i)=>{const a=i/verts.length*TAU;
+      const px=Math.cos(a)*r*v,py=Math.sin(a)*r*v;i?ctx.lineTo(px,py):ctx.moveTo(px,py);});
+    ctx.closePath();ctx.fill();ctx.stroke();ctx.restore();
+  }
+  // laser beams
+  for(const b of S.beams){
+    const [x,y,a,owner]=b,col=SLOT_COLORS[owner];
+    ctx.save();ctx.translate(x,y);ctx.rotate(a);
+    const g=ctx.createLinearGradient(0,0,720,0);
+    g.addColorStop(0,"#ffffff");g.addColorStop(1,col);
+    ctx.strokeStyle=g;ctx.shadowColor="#ffffff";ctx.shadowBlur=16;
+    ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(16,0);ctx.lineTo(720,0);ctx.stroke();
+    ctx.lineWidth=1.5;ctx.strokeStyle="#ffffff";
+    ctx.beginPath();ctx.moveTo(16,0);ctx.lineTo(720,0);ctx.stroke();
+    ctx.restore();
+  }
+  // shots
+  for(const b of S.shots){
+    const col=SLOT_COLORS[b[3]];
+    ctx.save();ctx.fillStyle=col;ctx.shadowColor=col;ctx.shadowBlur=10;
+    ctx.beginPath();ctx.arc(b[1],b[2],3.5,0,TAU);ctx.fill();ctx.restore();
+  }
+  for(const s of S.ships)drawShip(ctx,s);
+}
+
+function renderHUD(S){
+  const W=CFG.arenaW;
+  // timer
+  const tl=Math.ceil(S.time),rush=S.time<=CFG.finalRushAt&&roomState==="PLAY";
+  ctx.textAlign="center";ctx.font="bold 46px 'Courier New',monospace";
+  ctx.fillStyle=rush?"#ff5555":"#eaf2ff";
+  if(rush){ctx.shadowColor="#ff5555";ctx.shadowBlur=16+Math.sin(performance.now()/90)*8;}
+  ctx.fillText(String(tl),W/2,52);ctx.shadowBlur=0;
+  // score list, sorted, top-left
+  const rows=S.ships.slice().sort((a,b)=>b.d-a.d);
+  ctx.textAlign="left";ctx.font="bold 20px 'Courier New',monospace";
+  rows.forEach((s,i)=>{
+    ctx.fillStyle=SLOT_COLORS[s.sl];
+    ctx.globalAlpha=s.sl===Net.slot?1:.85;
+    ctx.fillText((s.sl===Net.slot?"▶ ":"  ")+s.nm+"  ★"+s.d,20,40+i*28);
+  });
+  ctx.globalAlpha=1;
+  // room code, bottom-right
+  ctx.textAlign="right";ctx.font="14px 'Courier New',monospace";ctx.fillStyle="#4d5880";
+  ctx.fillText("room "+Net.code,W-16,CFG.arenaH-14);
+  // my power status, bottom-center
+  const me=S.ships.find(s=>s.sl===Net.slot);
+  if(me&&(me.pw||me.sh)){
+    ctx.textAlign="center";ctx.font="bold 20px 'Courier New',monospace";
+    let msg=[];
+    if(me.pw)msg.push(POWERS[me.pw].name+(me.pt>0?" "+Math.ceil(me.pt)+"s":""));
+    if(me.sh)msg.push("SHRUNK");
+    ctx.fillStyle=me.pw?POWERS[me.pw].color:POWERS.shrink.color;
+    ctx.fillText(msg.join("  ·  "),W/2,CFG.arenaH-20);
+  }
+}
+
+function banner(text){
+  ctx.textAlign="center";ctx.font="bold 18px 'Courier New',monospace";
+  ctx.fillStyle="rgba(234,242,255,.8)";
+  ctx.fillText(text,CFG.arenaW/2,CFG.arenaH-48);
+}
+
+function renderSplash(S){
+  const W=CFG.arenaW,H=CFG.arenaH;
+  ctx.fillStyle="rgba(5,7,15,.72)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd23f";ctx.font="bold 44px 'Courier New',monospace";
+  ctx.fillText("STAR COLLECTOR",W/2,H/2-130);
+  ctx.fillStyle="#eaf2ff";ctx.font="20px 'Courier New',monospace";
+  ctx.fillText("Grab the most stardust before time runs out!",W/2,H/2-84);
+  ctx.fillStyle="#8fa2d9";ctx.font="16px 'Courier New',monospace";
+  ctx.fillText("Blast rivals to knock stardust loose · Shoot rocks to clear a path · Grab colored stars for power-ups",W/2,H/2-52);
+  const n=S.cd??0;
+  ctx.font="bold 110px 'Courier New',monospace";
+  ctx.fillStyle=n>0?"#ffffff":"#7dffb0";
+  ctx.shadowColor=n>0?"#ffffff":"#7dffb0";ctx.shadowBlur=30;
+  ctx.fillText(n>0?String(n):"GO!",W/2,H/2+90);ctx.shadowBlur=0;
+}
+
+function renderLobby(){
+  const W=CFG.arenaW,H=CFG.arenaH;
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd23f";ctx.shadowColor="#ffd23f";ctx.shadowBlur=24;
+  ctx.font="bold 60px 'Courier New',monospace";
+  ctx.fillText("★ STAR COLLECTOR ★",W/2,110);ctx.shadowBlur=0;
+  ctx.fillStyle="#8fa2d9";ctx.font="18px 'Courier New',monospace";
+  ctx.fillText("Share this link so pilots can join from their own machines:",W/2,158);
+  ctx.fillStyle="#7dffb0";ctx.font="bold 22px 'Courier New',monospace";
+  const shareBase=(Net.secure?"https://":"http://")+(Net.host||location.host);
+  ctx.fillText(shareBase+"/?room="+Net.code,W/2,190);
+
+  // pilot cards
+  const n=6,cw=180,gap=18,x0=(W-(cw*n+gap*(n-1)))/2,y0=250,ch=200;
+  for(let i=0;i<n;i++){
+    const p=roomPlayers.find(q=>q.slot===i);
+    const x=x0+i*(cw+gap);
+    ctx.globalAlpha=p?1:.3;
+    ctx.strokeStyle=SLOT_COLORS[i];ctx.lineWidth=p?3:1.5;
+    ctx.fillStyle="rgba(255,255,255,0.04)";
+    ctx.beginPath();ctx.roundRect(x,y0,cw,ch,12);ctx.fill();ctx.stroke();
+    drawShip(ctx,{sl:i,x:x+cw/2,y:y0+70,a:-Math.PI/2,pw:"",sw:0,iv:0,st:0,fl:0,th:0,sh:0,d:0,
+      nm:p?p.name:""});
+    ctx.textAlign="center";
+    ctx.fillStyle=p?SLOT_COLORS[i]:"#66719c";
+    ctx.font="bold 18px 'Courier New',monospace";
+    ctx.fillText(p?p.name+(p.host?" ♦":""):"— open —",x+cw/2,y0+150);
+    if(p&&p.slot===Net.slot){ctx.fillStyle="#fff";ctx.font="13px 'Courier New',monospace";
+      ctx.fillText("(you)",x+cw/2,y0+172);}
+    ctx.globalAlpha=1;
+  }
+
+  ctx.textAlign="center";
+  if(iAmHost){ctx.fillStyle="#7dffb0";ctx.font="bold 24px 'Courier New',monospace";
+    ctx.fillText("Press ENTER to launch ▶",W/2,530);}
+  else{ctx.fillStyle="#8fa2d9";ctx.font="20px 'Courier New',monospace";
+    ctx.fillText("Waiting for the host (♦) to launch…",W/2,530);}
+  ctx.fillStyle="#4d5880";ctx.font="15px 'Courier New',monospace";
+  ctx.fillText("◄ ►/A D turn · ▲/W thrust · SPACE fire — hits slow rivals & knock ★3 loose",W/2,580);
+  ctx.fillText("Power stars:  green TRI-SHOT · purple SHOTGUN · orange INVINCIBLE · white LASER · fuchsia SHRINK",W/2,606);
+  // color swatches under the legend
+  const types=["tri","shotgun","invinc","laser","shrink"];
+  types.forEach((tp,i)=>{
+    ctx.fillStyle=POWERS[tp].color;
+    drawStarShape(ctx,W/2-190+i*95,636,9,5);
+  });
+}
+
+function renderResults(){
+  const W=CFG.arenaW,H=CFG.arenaH;
+  ctx.fillStyle="rgba(5,7,15,.8)";ctx.fillRect(0,0,W,H);
+  if(!resultsData)return;
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd23f";ctx.shadowColor="#ffd23f";ctx.shadowBlur=26;
+  ctx.font="bold 54px 'Courier New',monospace";
+  ctx.fillText(resultsData.label,W/2,140);ctx.shadowBlur=0;
+  resultsData.rows.forEach((r,i)=>{
+    const y=230+i*50,win=(resultsData.winners||[]).includes(r.slot);
+    ctx.fillStyle=SLOT_COLORS[r.slot];
+    ctx.font=(win?"bold 28px":"22px")+" 'Courier New',monospace";
+    ctx.fillText((win?"👑 ":"")+(i+1)+".  "+r.name+"   ★"+r.dust+"   (collected "+r.total+" total)",W/2,y);
+  });
+  ctx.font="bold 20px 'Courier New',monospace";
+  if(iAmHost){ctx.fillStyle="#7dffb0";
+    ctx.fillText("ENTER: play again      B: back to lobby",W/2,H-70);}
+  else{ctx.fillStyle="#8fa2d9";ctx.fillText("Waiting for the host…",W/2,H-70);}
+}
+
+/* ---------- loop ---------- */
+let lastT=performance.now();
+function loop(now){
+  FX.update(Math.min((now-lastT)/1000,0.1));lastT=now;
+  if(!$("join").classList.contains("hidden")){requestAnimationFrame(loop);return;}
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+fit();
+</script>
+</body>
+</html>

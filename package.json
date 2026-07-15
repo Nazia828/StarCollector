@@ -1,0 +1,12 @@
+{
+  "name": "star-collector-online",
+  "version": "2.0.0",
+  "description": "Star Collector — online multiplayer party mini-game (1-6 players)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
